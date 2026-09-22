@@ -102,6 +102,39 @@ class ParsingTests(unittest.TestCase):
                     self.assertFalse(scanner.scan())  # reused TID needs a fresh baseline
                 scanner.reader.close()
 
+    def test_nanosecond_runtime_ignores_tick_rounding_and_rebaselines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'self').mkdir()
+            (root / 'self' / 'schedstat').write_text('1 0 0')
+            process = root / '987654'
+            task = process / 'task' / '987654'
+            task.mkdir(parents=True)
+            (process / 'status').write_text('Uid:\t456\t456\t456\t456\n')
+            stat = task / 'stat'
+            runtime = task / 'schedstat'
+            scanner = cw.Scanner({2}, set(), directory)
+            self.assertTrue(scanner.high_resolution)
+            with mock.patch.object(cw.time, 'monotonic') as clock:
+                for second, ticks, ns, expected in (
+                    (0, 10, 100000000, None),
+                    (1, 11, 100140000, None),
+                    (2, 11, 112480000, 1.234),
+                    (3, 12, None, None),
+                    (4, 13, 200000000, None),
+                    (5, 14, 215670000, 1.567),
+                ):
+                    clock.return_value = second
+                    stat.write_text(stat_line(ticks, state='R'))
+                    runtime.write_text('' if ns is None else '{} 0 0'.format(ns))
+                    hits = scanner.scan()
+                    if expected is None:
+                        self.assertFalse(hits)
+                    else:
+                        self.assertAlmostEqual(hits[0][6], expected)
+                    self.assertEqual(scanner.runtime_fallbacks, int(ns is None))
+            scanner.reader.close()
+
     def test_idle_placement_respects_original_mask(self):
         with mock.patch.object(cw.os, 'sched_getaffinity', return_value={1, 2, 3, 4}), \
              mock.patch.object(cw.os, 'sched_setaffinity') as setter, \
@@ -139,8 +172,10 @@ t.join()
                     break
                 time.sleep(0.05)
             self.assertTrue(found, 'worker thread was not detected')
+            scanner.reader.close()
             excluded = cw.Scanner({cpu}, {os.getuid()})
             self.assertFalse(any(key[0] == process.pid for key, *_ in excluded.scan()))
+            excluded.reader.close()
         finally:
             process.terminate()
             process.wait(timeout=3)

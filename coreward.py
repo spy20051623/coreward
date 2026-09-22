@@ -154,6 +154,11 @@ class Scanner:
         self.threshold = threshold
         self.clock_ticks = os.sysconf('SC_CLK_TCK')
         self.cpus, self.excluded, self.proc = cpus, excluded, proc
+        try:
+            self.high_resolution = int(read(proc + '/self/schedstat').split()[0]) > 0
+        except (OSError, ValueError, IndexError):
+            self.high_resolution = False
+        self.runtime_fallbacks = 0
         self.previous = {}
         self.denied = 0
         self.scanned = 0
@@ -163,6 +168,7 @@ class Scanner:
         previous, current, hits = self.previous, {}, []
         sampled_at = time.monotonic()
         self.denied = self.scanned = 0
+        self.runtime_fallbacks = 0
         with os.scandir(self.proc) as processes:
             for process in processes:
                 if not process.name.isdecimal() or int(process.name) == os.getpid():
@@ -187,11 +193,27 @@ class Scanner:
                             self.scanned += 1
                             key = (int(process.name), int(tid), start)
                             old = previous.get(key)
-                            current[key] = (ticks, sampled_at)
+                            runtime_ns = None
+                            observed_at = sampled_at
+                            if self.high_resolution:
+                                try:
+                                    runtime_ns = int(self.reader.read(task + tid + '/schedstat').split()[0])
+                                    observed_at = time.monotonic()
+                                except (PermissionError, FileNotFoundError, ProcessLookupError, ValueError, IndexError):
+                                    self.runtime_fallbacks += 1
+                            # Never compare different clocks after fallback or recovery.
+                            if old is not None and ((old[2] is None) != (runtime_ns is None)):
+                                old = None
+                            current[key] = (ticks, observed_at, runtime_ns)
                             delta = ticks - old[0] if old is not None else 0
-                            if cpu in self.cpus and (delta > 0 or state == 'R'):
-                                elapsed = sampled_at - old[1] if old is not None else 0
-                                cpu_pct = (100.0 * max(0, delta) / self.clock_ticks / elapsed
+                            elapsed = observed_at - old[1] if old is not None else 0
+                            runtime_delta = (runtime_ns - old[2]
+                                             if runtime_ns is not None and old is not None else 0)
+                            active = runtime_delta > 0 if runtime_ns is not None else delta > 0
+                            if cpu in self.cpus and (active or state == 'R'):
+                                cpu_seconds = (max(0, runtime_delta) / 1e9 if runtime_ns is not None
+                                               else max(0, delta) / self.clock_ticks)
+                                cpu_pct = (100.0 * cpu_seconds / elapsed
                                            if elapsed > 0 else 0.0)
                                 # Positive thresholds need two samples, including
                                 # for runnable tasks and newly reused thread IDs.
@@ -319,10 +341,14 @@ def main():
     except (ValueError, KeyError, OSError) as error:
         parser.error(str(error))
     scanner = Scanner(cpus, excluded, scope=args.scope, threshold=args.threshold)
+    if not scanner.high_resolution:
+        warn('nanosecond runtime unavailable; using coarse stat ticks ({} ticks/s). '
+             'Low thresholds can produce quantization noise.'.format(scanner.clock_ticks))
     placement = low_priority(cpus) if args.low_priority else None
-    print('watch={}\ninterval={}s scope={} threshold={}% of one core exclude_uids={}\n'
+    print('watch={}\ninterval={}s scope={} threshold={}% of one core exclude_uids={} clock={}\n'
           'last_cpu is a sampled hint, not a scheduling trace'.format(
-          format_cpus(cpus), args.interval, args.scope, args.threshold, sorted(excluded)),
+          format_cpus(cpus), args.interval, args.scope, args.threshold, sorted(excluded),
+          'schedstat-ns' if scanner.high_resolution else 'stat-ticks'),
           file=sys.stderr, flush=True)
     if args.scope == 'process':
         print('process scope checks main threads only; worker-thread activity is not covered',
@@ -379,9 +405,10 @@ def main():
         # Brief sleep/wake cycles must not bypass the output cooldown.
         reported = {key: value for key, value in reported.items()
                     if key in active or now - value < args.repeat}
-        if (scanner.denied or scan_time > args.interval) and now - last_warning >= 10:
-            warn('scan={:.1f}ms denied={} (permission denials mean incomplete coverage)'.format(
-                 scan_time * 1000, scanner.denied))
+        if (scanner.denied or scanner.runtime_fallbacks or scan_time > args.interval) and now - last_warning >= 10:
+            warn('scan={:.1f}ms denied={} coarse_clock_fallbacks={} '
+                 '(denials mean incomplete coverage; coarse clocks can cause threshold noise)'.format(
+                 scan_time * 1000, scanner.denied, scanner.runtime_fallbacks))
             last_warning = now
         next_poll += args.interval
         current_time = time.monotonic()
