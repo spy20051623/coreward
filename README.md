@@ -56,7 +56,10 @@
 ## 输出示例
 
 ```text
-2026-01-01 12:00:00 user="alice" uid=1000 pid=1234 tid=1235 last_cpu=6 state=R delta_ticks=5 cpu_pct=5.25 comm="worker"
+watch=0-7
+2026-01-01 12:00:00  pid=1234     tid=1235     last_cpu=6     cpu_pct=  5.25%
+  user="alice"                uid=1000       state=R   delta_ticks=5
+  comm="worker"
 ```
 
 `PID` 是进程编号，`TID` 是线程编号，`last_cpu` 是最近运行核。`cpu_pct` 是该线程在采样期间的 CPU 使用率，100% 表示占满一个逻辑核。

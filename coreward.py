@@ -31,6 +31,31 @@ def read(path):
         return stream.read()
 
 
+def format_cpus(cpus):
+    ranges = []
+    first = last = None
+    for cpu in sorted(set(cpus)):
+        if first is None:
+            first = last = cpu
+        elif cpu == last + 1:
+            last = cpu
+        else:
+            ranges.append(str(first) if first == last else '{}-{}'.format(first, last))
+            first = last = cpu
+    if first is not None:
+        ranges.append(str(first) if first == last else '{}-{}'.format(first, last))
+    return ','.join(ranges)
+
+
+def format_hit(timestamp, user, uid, pid, tid, cpu, state, delta, cpu_pct, comm):
+    # Minimum widths only: never truncate identifiers or command names.
+    return ('{}  pid={:<8} tid={:<8} last_cpu={:<5} cpu_pct={:>6.2f}%\n'
+            '  user={:<22} uid={:<10} state={:<3} delta_ticks={}\n'
+            '  comm={}').format(timestamp, pid, tid, cpu, cpu_pct,
+                               json.dumps(user, ensure_ascii=True), uid, state, delta,
+                               json.dumps(comm, ensure_ascii=True))
+
+
 def excluded_users(value):
     if value is None:
         # sudo defaults to the invoking user, not root.
@@ -295,8 +320,10 @@ def main():
         parser.error(str(error))
     scanner = Scanner(cpus, excluded, scope=args.scope, threshold=args.threshold)
     placement = low_priority(cpus) if args.low_priority else None
-    print('watch={} exclude_uids={} interval={}s scope={} threshold={}% of one core; last_cpu is a sampled hint, not a scheduling trace'.format(
-          sorted(cpus), sorted(excluded), args.interval, args.scope, args.threshold), file=sys.stderr, flush=True)
+    print('watch={}\ninterval={}s scope={} threshold={}% of one core exclude_uids={}\n'
+          'last_cpu is a sampled hint, not a scheduling trace'.format(
+          format_cpus(cpus), args.interval, args.scope, args.threshold, sorted(excluded)),
+          file=sys.stderr, flush=True)
     if args.scope == 'process':
         print('process scope checks main threads only; worker-thread activity is not covered',
               file=sys.stderr, flush=True)
@@ -346,9 +373,8 @@ def main():
                     users[uid] = pwd.getpwuid(uid).pw_name
                 except KeyError:
                     users[uid] = str(uid)
-            print('{} user={} uid={} pid={} tid={} last_cpu={} state={} delta_ticks={} cpu_pct={:.2f} comm={}'.format(
-                  time.strftime('%Y-%m-%d %H:%M:%S'), json.dumps(users[uid]), uid, key[0], key[1],
-                  cpu, state, delta, cpu_pct, json.dumps(comm, ensure_ascii=True)), flush=True)
+            print(format_hit(time.strftime('%Y-%m-%d %H:%M:%S'), users[uid], uid, key[0], key[1],
+                             cpu, state, delta, cpu_pct, comm), flush=True)
             reported[identity] = now
         # Brief sleep/wake cycles must not bypass the output cooldown.
         reported = {key: value for key, value in reported.items()
