@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local project instructions may contain private infrastructure details.
+/AGENTS.md
