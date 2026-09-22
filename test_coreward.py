@@ -51,12 +51,12 @@ class ParsingTests(unittest.TestCase):
             (root / 'status').write_text('Uid:\t123\t456\t123\t123\n')
             path = thread / 'stat'
             path.write_text(stat_line(10))
-            scanner = cw.Scanner({2}, set(), directory)
+            scanner = cw.Scanner({2}, set(), directory, threshold=0)
             self.assertFalse(scanner.scan())  # historical sleeping CPU is not a hit
             path.write_text(stat_line(11))
             hit = scanner.scan()[0]
             self.assertEqual(hit[0], (987654, 987655, 5))
-            self.assertEqual((hit[1], hit[-1]), (456, 1))
+            self.assertEqual((hit[1], hit[5]), (456, 1))
             self.assertFalse(scanner.scan())
             path.write_text(stat_line(100, start=6))
             self.assertFalse(scanner.scan())  # reused TID resets baseline
@@ -64,19 +64,43 @@ class ParsingTests(unittest.TestCase):
             self.assertFalse(scanner.scan())
             path.write_text(stat_line(102, start=6, state='R'))
             self.assertTrue(scanner.scan())
-            process_scanner = cw.Scanner({2}, set(), directory, scope='process')
+            process_scanner = cw.Scanner({2}, set(), directory, scope='process', threshold=0)
             with mock.patch.object(cw.os, 'scandir', wraps=os.scandir) as scan_dirs:
                 self.assertFalse(process_scanner.scan())  # active worker is not a main thread
                 self.assertEqual(scan_dirs.call_count, 1)  # no task directory traversal
             self.assertEqual(process_scanner.scanned, 1)
             (leader / 'stat').write_text(stat_line(1, state='R'))
             self.assertEqual(process_scanner.scan()[0][0], (987654, 987654, 5))
-            self.assertFalse(cw.Scanner({2}, {456}, directory, scope='process').scan())
+            self.assertFalse(cw.Scanner({2}, {456}, directory, scope='process', threshold=0).scan())
             (leader / 'stat').write_text(leader_data[0] + ') ' + ' '.join(fields))
-            self.assertFalse(cw.Scanner({2}, {456}, directory).scan())
+            self.assertFalse(cw.Scanner({2}, {456}, directory, threshold=0).scan())
             path.unlink()  # racing exit is harmless
             thread.rmdir()
             self.assertFalse(scanner.scan())
+
+    def test_threshold_uses_sample_interval_and_resets_on_reuse(self):
+        for scope in ('thread', 'process'):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / '987654'
+                task = root / 'task' / '987654'
+                task.mkdir(parents=True)
+                (root / 'status').write_text('Uid:\t456\t456\t456\t456\n')
+                path = task / 'stat'
+                scanner = cw.Scanner({2}, set(), directory, scope=scope, threshold=5)
+                scanner.clock_ticks = 100
+                with mock.patch.object(cw.time, 'monotonic', side_effect=[0, 1, 3, 4, 5, 6]):
+                    path.write_text(stat_line(100, state='R'))
+                    self.assertFalse(scanner.scan())  # baseline, no lifetime average
+                    path.write_text(stat_line(101, state='R'))
+                    self.assertFalse(scanner.scan())  # 1%, even though runnable
+                    path.write_text(stat_line(109, state='R'))
+                    self.assertFalse(scanner.scan())  # 8 ticks / actual 2 s = 4%
+                    path.write_text(stat_line(114, state='R'))
+                    self.assertEqual(scanner.scan()[0][6], 5.0)  # inclusive minimum
+                    self.assertFalse(scanner.scan())  # no CPU time, runnable alone is insufficient
+                    path.write_text(stat_line(999, start=9, state='R'))
+                    self.assertFalse(scanner.scan())  # reused TID needs a fresh baseline
+                scanner.reader.close()
 
     def test_idle_placement_respects_original_mask(self):
         with mock.patch.object(cw.os, 'sched_getaffinity', return_value={1, 2, 3, 4}), \
@@ -135,7 +159,8 @@ print(subprocess.check_output(['ionice', '-p', str(os.getpid())], text=True))
 
     def test_cli_validation_and_duration(self):
         script = str(Path(cw.__file__).resolve())
-        for args in (['2-1'], ['0', '-i', 'nan'], ['0', '--scope', 'invalid'],
+        for args in (['2-1'], ['0', '-i', 'nan'], ['0', '--scope', 'invalid'], ['0', '-t', '-1'], ['0', '-t', 'nan'],
+                     ['0', '--threshold', '101'],
                      ['0', '--exclude-users', 'nobody-with-this-name-coreward']):
             result = subprocess.run([sys.executable, script] + args, capture_output=True, text=True)
             self.assertEqual(result.returncode, 2)
@@ -146,10 +171,12 @@ print(subprocess.check_output(['ionice', '-p', str(os.getpid())], text=True))
         self.assertIn('interval=1.0s', result.stderr)
         self.assertIn('samples=1 ', result.stderr)
         self.assertIn('scope=thread', result.stderr)
-        result = subprocess.run([sys.executable, script, cpu, '-d', '.5', '-s', 'process', '-x', '', '-i', '1', '-r', '3'],
+        self.assertIn('threshold=1.0%', result.stderr)
+        result = subprocess.run([sys.executable, script, cpu, '-d', '.5', '-s', 'process', '-x', '', '-i', '1', '-r', '3', '-t', '5'],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('scope=process', result.stderr)
+        self.assertIn('threshold=5.0%', result.stderr)
         self.assertIn('exclude_uids=[]', result.stderr)
         self.assertIn('main threads only', result.stderr)
 

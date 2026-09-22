@@ -122,10 +122,12 @@ class StatReader:
 
 
 class Scanner:
-    def __init__(self, cpus, excluded, proc='/proc', scope='thread'):
+    def __init__(self, cpus, excluded, proc='/proc', scope='thread', threshold=1.0):
         if scope not in ('thread', 'process'):
             raise ValueError('scope must be thread or process')
         self.scope = scope
+        self.threshold = threshold
+        self.clock_ticks = os.sysconf('SC_CLK_TCK')
         self.cpus, self.excluded, self.proc = cpus, excluded, proc
         self.previous = {}
         self.denied = 0
@@ -134,6 +136,7 @@ class Scanner:
 
     def scan(self):
         previous, current, hits = self.previous, {}, []
+        sampled_at = time.monotonic()
         self.denied = self.scanned = 0
         with os.scandir(self.proc) as processes:
             for process in processes:
@@ -159,15 +162,22 @@ class Scanner:
                             self.scanned += 1
                             key = (int(process.name), int(tid), start)
                             old = previous.get(key)
-                            current[key] = ticks
-                            delta = ticks - old if old is not None else 0
+                            current[key] = (ticks, sampled_at)
+                            delta = ticks - old[0] if old is not None else 0
                             if cpu in self.cpus and (delta > 0 or state == 'R'):
+                                elapsed = sampled_at - old[1] if old is not None else 0
+                                cpu_pct = (100.0 * max(0, delta) / self.clock_ticks / elapsed
+                                           if elapsed > 0 else 0.0)
+                                # Positive thresholds need two samples, including
+                                # for runnable tasks and newly reused thread IDs.
+                                if self.threshold > 0 and (old is None or cpu_pct < self.threshold):
+                                    continue
                                 # Resolve credentials only for candidate processes,
                                 # never cache UID across scans or PID reuse.
                                 if uid is None:
                                     uid = effective_uid(read(process.path + '/status'))
                                 if uid not in self.excluded:
-                                    hits.append((key, uid, cpu, comm, state, delta))
+                                    hits.append((key, uid, cpu, comm, state, delta, cpu_pct))
                         except PermissionError:
                             self.denied += 1
                         except (FileNotFoundError, ProcessLookupError):
@@ -254,6 +264,13 @@ def positive(value):
     return number
 
 
+def percentage(value):
+    number = float(value)
+    if not math.isfinite(number) or not 0 <= number <= 100:
+        raise argparse.ArgumentTypeError('must be finite and between 0 and 100')
+    return number
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('cpus', help='CPU IDs, e.g. 0-3,8,10')
@@ -264,6 +281,8 @@ def main():
                         help='replace default current-user exclusion; empty string excludes nobody')
     parser.add_argument('-l', '--low-priority', action='store_true', help='idle scheduling and idle CPU selection')
     parser.add_argument('-r', '--repeat', type=positive, default=5.0, help='repeat persistent sightings after N seconds (default: 5)')
+    parser.add_argument('-t', '--threshold', type=percentage, default=1.0, metavar='PERCENT',
+                        help='minimum sampled CPU %% of one core (default: 1.0; 0 disables filtering)')
     parser.add_argument('-d', '--duration', type=positive, help='stop after N seconds; default runs until Ctrl+C')
     args = parser.parse_args()
     try:
@@ -274,10 +293,10 @@ def main():
         excluded = excluded_users(args.exclude_users)
     except (ValueError, KeyError, OSError) as error:
         parser.error(str(error))
-    scanner = Scanner(cpus, excluded, scope=args.scope)
+    scanner = Scanner(cpus, excluded, scope=args.scope, threshold=args.threshold)
     placement = low_priority(cpus) if args.low_priority else None
-    print('watch={} exclude_uids={} interval={}s scope={}; last_cpu is a sampled hint, not a scheduling trace'.format(
-          sorted(cpus), sorted(excluded), args.interval, args.scope), file=sys.stderr, flush=True)
+    print('watch={} exclude_uids={} interval={}s scope={} threshold={}% of one core; last_cpu is a sampled hint, not a scheduling trace'.format(
+          sorted(cpus), sorted(excluded), args.interval, args.scope, args.threshold), file=sys.stderr, flush=True)
     if args.scope == 'process':
         print('process scope checks main threads only; worker-thread activity is not covered',
               file=sys.stderr, flush=True)
@@ -317,7 +336,7 @@ def main():
         max_threads = max(max_threads, scanner.scanned)
         samples += 1
         active = set()
-        for key, uid, cpu, comm, state, delta in hits:
+        for key, uid, cpu, comm, state, delta, cpu_pct in hits:
             identity = (key, uid, cpu)
             active.add(identity)
             if now - reported.get(identity, -float('inf')) < args.repeat:
@@ -327,9 +346,9 @@ def main():
                     users[uid] = pwd.getpwuid(uid).pw_name
                 except KeyError:
                     users[uid] = str(uid)
-            print('{} user={} uid={} pid={} tid={} last_cpu={} state={} delta_ticks={} comm={}'.format(
+            print('{} user={} uid={} pid={} tid={} last_cpu={} state={} delta_ticks={} cpu_pct={:.2f} comm={}'.format(
                   time.strftime('%Y-%m-%d %H:%M:%S'), json.dumps(users[uid]), uid, key[0], key[1],
-                  cpu, state, delta, json.dumps(comm, ensure_ascii=True)), flush=True)
+                  cpu, state, delta, cpu_pct, json.dumps(comm, ensure_ascii=True)), flush=True)
             reported[identity] = now
         # Brief sleep/wake cycles must not bypass the output cooldown.
         reported = {key: value for key, value in reported.items()
