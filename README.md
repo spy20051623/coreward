@@ -60,9 +60,12 @@ watch=0-7
 2026-01-01 12:00:00  pid=1234     tid=1235     last_cpu=6     cpu_pct=  5.25%
   user="alice"                uid=1000       state=R   delta_ticks=5
   comm="worker"
+  command="python3 server.py --port 8080"
 ```
 
 `PID` 是进程编号，`TID` 是线程编号，`last_cpu` 是最近运行核。`cpu_pct` 是该线程在采样期间的 CPU 使用率，100% 表示占满一个逻辑核。
+
+`comm` 是线程短名称，`command` 显示所属进程的完整命令行及参数；读取受限或进程已退出时会标明不可用。
 
 ## 使用须知
 

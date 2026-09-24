@@ -7,6 +7,7 @@ import os
 import pwd
 import re
 import resource
+import shlex
 import signal
 import subprocess
 import sys
@@ -47,13 +48,39 @@ def format_cpus(cpus):
     return ','.join(ranges)
 
 
-def format_hit(timestamp, user, uid, pid, tid, cpu, state, delta, cpu_pct, comm):
+def command_line(key, proc='/proc'):
+    pid, tid, start = key
+    task_stat = '{}/{}/task/{}/stat'.format(proc, pid, tid)
+    try:
+        if parse_record(read(task_stat))[3] != start:
+            return '<unavailable: task changed>'
+        with open('{}/{}/cmdline'.format(proc, pid), 'rb') as stream:
+            raw = stream.read()
+        if parse_record(read(task_stat))[3] != start:
+            return '<unavailable: task changed>'
+    except PermissionError:
+        return '<unavailable: permission denied>'
+    except (FileNotFoundError, ProcessLookupError):
+        return '<unavailable: task exited>'
+    except (OSError, ValueError, IndexError):
+        return '<unavailable: read failed>'
+    if not raw:
+        return '<no command line>'
+    argv = raw.split(b'\0')
+    if argv[-1] == b'':
+        argv.pop()
+    return ' '.join(shlex.quote(arg.decode('utf-8', errors='replace')) for arg in argv)
+
+
+def format_hit(timestamp, user, uid, pid, tid, cpu, state, delta, cpu_pct, comm, command):
     # Minimum widths only: never truncate identifiers or command names.
     return ('{}  pid={:<8} tid={:<8} last_cpu={:<5} cpu_pct={:>6.2f}%\n'
             '  user={:<22} uid={:<10} state={:<3} delta_ticks={}\n'
-            '  comm={}').format(timestamp, pid, tid, cpu, cpu_pct,
+            '  comm={}\n'
+            '  command={}').format(timestamp, pid, tid, cpu, cpu_pct,
                                json.dumps(user, ensure_ascii=True), uid, state, delta,
-                               json.dumps(comm, ensure_ascii=True))
+                               json.dumps(comm, ensure_ascii=True),
+                               json.dumps(command, ensure_ascii=True))
 
 
 def excluded_users(value):
@@ -400,7 +427,7 @@ def main():
                 except KeyError:
                     users[uid] = str(uid)
             print(format_hit(time.strftime('%Y-%m-%d %H:%M:%S'), users[uid], uid, key[0], key[1],
-                             cpu, state, delta, cpu_pct, comm), flush=True)
+                             cpu, state, delta, cpu_pct, comm, command_line(key)), flush=True)
             reported[identity] = now
         # Brief sleep/wake cycles must not bypass the output cooldown.
         reported = {key: value for key, value in reported.items()

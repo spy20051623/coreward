@@ -1,5 +1,7 @@
 """Unit and Linux integration checks. Run: python3 -m unittest -v."""
 import os
+import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,30 @@ def stat_line(ticks=0, cpu=2, state='S', start=5, comm='a ) tricky name'):
 
 
 class ParsingTests(unittest.TestCase):
+    def test_full_command_line_and_unavailable_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = Path(directory) / '987654'
+            task = process / 'task' / '987655'
+            task.mkdir(parents=True)
+            (task / 'stat').write_text(stat_line(start=5))
+            path = process / 'cmdline'
+            argv = ['python3', '/path with spaces/server.py', '--name', '', 'a\nb\x1b[31m', 'x' * 8192]
+            path.write_bytes(b'\0'.join(arg.encode() for arg in argv) + b'\0')
+            key = (987654, 987655, 5)
+            command = cw.command_line(key, directory)
+            self.assertEqual(shlex.split(command), argv)
+            output = cw.format_hit('time', 'alice', 123, 987654, 987655, 2, 'R', 1, 1.2, 'worker', command)
+            self.assertEqual(len(output.splitlines()), 4)
+            self.assertEqual(json.loads(output.split('  command=', 1)[1]), command)
+            path.write_bytes(b'')
+            self.assertEqual(cw.command_line(key, directory), '<no command line>')
+            with mock.patch('builtins.open', side_effect=PermissionError):
+                self.assertEqual(cw.command_line(key, directory), '<unavailable: permission denied>')
+            (task / 'stat').write_text(stat_line(start=6))
+            self.assertEqual(cw.command_line(key, directory), '<unavailable: task changed>')
+            (task / 'stat').unlink()
+            self.assertEqual(cw.command_line(key, directory), '<unavailable: task exited>')
+
     def test_cpu_lists(self):
         self.assertEqual(cw.cpu_list('0-2,5,2'), {0, 1, 2, 5})
         for value in ('', '2-1', 'a', '1,,2', '-1', '1-', '1.0', '0-999999999'):
